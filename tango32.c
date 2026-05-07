@@ -11,62 +11,6 @@
 #include <linux/dirent.h>
 #include "tango32.h"
 
-/* fdget_pos and fdput_pos are not exported to modules. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-
-static inline bool file_needs_f_pos_lock(struct file *file)
-{
-	return (file->f_mode & FMODE_ATOMIC_POS) &&
-		(file_count(file) > 1 || file->f_op->iterate_shared);
-}
-
-static struct fd my_fdget_pos(unsigned int fd)
-{
-	struct fd f = fdget(fd);
-	struct file *file = fd_file(f);
-
-	if (file && file_needs_f_pos_lock(file)) {
-		f.word |= FDPUT_POS_UNLOCK;
-		mutex_lock(&file->f_pos_lock);
-	}
-	return f;
-}
-static void my_fdput_pos(struct fd f)
-{
-	if (f.word & FDPUT_POS_UNLOCK)
-		mutex_unlock(&fd_file(f)->f_pos_lock);
-	fdput(f);
-}
-
-#else
-
-static struct fd my_fdget_pos(unsigned int fd)
-{
-	struct fd f = fdget(fd);
-	if (f.file && (f.file->f_mode & FMODE_ATOMIC_POS)) {
-		if (file_count(f.file) > 1) {
-			f.flags |= FDPUT_POS_UNLOCK;
-			mutex_lock(&f.file->f_pos_lock);
-		}
-	}
-	return f;
-}
-static void my_fdput_pos(struct fd fd)
-{
-	if (fd.flags & FDPUT_POS_UNLOCK)
-		mutex_unlock(&fd.file->f_pos_lock);
-	fdput(fd);
-}
-
-// These wrappers are not available on older kernels.
-#define fd_file(f) (f).file
-static inline bool fd_empty(struct fd f)
-{
-	return unlikely(!f.file);
-}
-
-#endif
-
 static bool is_32bit(void)
 {
 	return test_thread_flag(TIF_32BIT);
@@ -214,10 +158,10 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	if (mmap_read_lock_killable(mm))
+	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 #else
-	if (down_read_killable(&mm->mmap_sem))
+	if (down_write_killable(&mm->mmap_sem))
 		return -EINTR;
 #endif
 
@@ -239,9 +183,9 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 		memcpy(mm->saved_auxv, user_auxv, sizeof(user_auxv));
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	mmap_read_unlock(mm);
+	mmap_write_unlock(mm);
 #else
-	up_read(&mm->mmap_sem);
+	up_write(&mm->mmap_sem);
 #endif
 
 	return retval;
@@ -286,21 +230,25 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 		return -EFAULT;
 
 	f = fdget(args.fd);
-	if (fd_empty(f))
+	if (!f.file)
 		return -EBADF;
 
 	/*
 	 * Pretend to be a 32-bit task for the duration of this syscall.
+	 * Disable preemption and softirqs to prevent interrupt handlers
+	 * from seeing the wrong TIF_32BIT state.
 	 */
+	preempt_disable();
+	local_bh_disable();
 	set_32bit(true);
 
-	retval = security_file_ioctl(fd_file(f), args.cmd, args.arg);
+	retval = security_file_ioctl(f.file, args.cmd, args.arg);
 	if (retval)
 		goto out;
 
 	retval = -ENOIOCTLCMD;
-	if (fd_file(f)->f_op->compat_ioctl)
-		retval = fd_file(f)->f_op->compat_ioctl(fd_file(f), args.cmd, args.arg);
+	if (f.file->f_op->compat_ioctl)
+		retval = f.file->f_op->compat_ioctl(f.file, args.cmd, args.arg);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
 #warning "Support for kernels before v5.6 is experimental"
@@ -309,13 +257,15 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	 * workaround we pass the ioctls through unmodified if compat_ioctl is
 	 * not provided. This should work for most ioctls.
 	 */
-	else if (fd_file(f)->f_op->unlocked_ioctl)
-		retval = fd_file(f)->f_op->unlocked_ioctl(fd_file(f), args.cmd,
+	else
+		retval = f.file->f_op->unlocked_ioctl(f.file, args.cmd,
 						      args.arg);
 #endif
 
 out:
 	set_32bit(false);
+	local_bh_enable();
+	preempt_enable();
 	fdput(f);
 
 	return retval;
@@ -471,6 +421,25 @@ efault:
 }
 #endif
 
+/* fdget_pos and fdput_pos are not exported to modules. */
+static struct fd my_fdget_pos(unsigned int fd)
+{
+	struct fd f = fdget(fd);
+	if (f.file && (f.file->f_mode & FMODE_ATOMIC_POS)) {
+		if (file_count(f.file) > 1) {
+			f.flags |= FDPUT_POS_UNLOCK;
+			mutex_lock(&f.file->f_pos_lock);
+		}
+	}
+	return f;
+}
+static void my_fdput_pos(struct fd fd)
+{
+	if (fd.flags & FDPUT_POS_UNLOCK)
+		mutex_unlock(&fd.file->f_pos_lock);
+	fdput(fd);
+}
+
 static long
 tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 {
@@ -483,19 +452,14 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
-	if (!fd_file(f))
+	if (!f.file)
 		return -EBADF;
-
-	/*
-	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 */
-	set_32bit(true);
 
 	buf.ctx.actor = filldir64;
 	buf.count = args.count;
 	buf.current_dir = (struct linux_dirent64 __user *)args.dirp;
 
-	error = iterate_dir(fd_file(f), &buf.ctx);
+	error = iterate_dir(f.file, &buf.ctx);
 	if (error >= 0)
 		error = buf.error;
 	if (buf.prev_reclen) {
@@ -509,7 +473,6 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 			error = args.count - buf.count;
 	}
 
-	set_32bit(false);
 	my_fdput_pos(f);
 	return error;
 }
@@ -525,19 +488,14 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
-	if (fd_empty(f))
+	if (!f.file)
 		return -EBADF;
-
-	/*
-	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 */
-	set_32bit(true);
 
 	retval = -EINVAL;
 	if (args.whence > SEEK_MAX)
 		goto out_putf;
 
-	offset = vfs_llseek(fd_file(f), args.offset, args.whence);
+	offset = vfs_llseek(f.file, args.offset, args.whence);
 
 	retval = (int)offset;
 	if (offset >= 0) {
@@ -548,10 +506,10 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	}
 
 out_putf:
-	set_32bit(false);
 	my_fdput_pos(f);
 	return retval;
 }
+
 
 static long tango32_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
