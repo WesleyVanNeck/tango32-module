@@ -22,6 +22,11 @@ static void set_32bit(bool val)
 		set_thread_flag(TIF_32BIT);
 	else
 		clear_thread_flag(TIF_32BIT);
+	/*
+	 * Ensure the flag change is visible before any subsequent
+	 * operations that depend on it (e.g., in_compat_syscall).
+	 */
+	smp_mb();
 }
 
 static long tango32_get_version(struct tango32_abi_version __user *argp)
@@ -29,6 +34,9 @@ static long tango32_get_version(struct tango32_abi_version __user *argp)
 	bool compat;
 	struct tango32_abi_version abi = { .major = TANGO32_ABI_MAJOR,
 					   .minor = TANGO32_ABI_MINOR };
+
+	if (!access_ok(argp, sizeof(abi)))
+		return -EFAULT;
 
 	/*
 	 * Sanity check: ensure that setting TIF_32BIT properly results in
@@ -128,6 +136,9 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 
 	BUILD_BUG_ON(sizeof(user_auxv) != sizeof(mm->saved_auxv));
 
+	if (!access_ok(argp, sizeof(mm_fields)))
+		return -EFAULT;
+
 	if (copy_from_user(&mm_fields, argp, sizeof(mm_fields)))
 		return -EFAULT;
 
@@ -158,10 +169,10 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	if (mmap_write_lock_killable(mm))
+	if (mmap_read_lock_killable(mm))
 		return -EINTR;
 #else
-	if (down_write_killable(&mm->mmap_sem))
+	if (down_read_killable(&mm->mmap_sem))
 		return -EINTR;
 #endif
 
@@ -183,9 +194,9 @@ static long tango32_set_mm(struct tango32_mm __user *argp)
 		memcpy(mm->saved_auxv, user_auxv, sizeof(user_auxv));
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-	mmap_write_unlock(mm);
+	mmap_read_unlock(mm);
 #else
-	up_write(&mm->mmap_sem);
+	up_read(&mm->mmap_sem);
 #endif
 
 	return retval;
@@ -225,6 +236,10 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	struct tango32_compat_ioctl args;
 	struct fd f;
 	long retval;
+	unsigned long flags;
+
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
@@ -235,11 +250,12 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 
 	/*
 	 * Pretend to be a 32-bit task for the duration of this syscall.
-	 * Disable preemption and softirqs to prevent interrupt handlers
-	 * from seeing the wrong TIF_32BIT state.
+	 * Disable local interrupts to prevent ANY handler (including NMIs
+	 * on some platforms) from seeing inconsistent TIF_32BIT state.
+	 * This is heavier than preempt_disable() but necessary for safety
+	 * when manipulating thread flags that affect syscall dispatch.
 	 */
-	preempt_disable();
-	local_bh_disable();
+	local_irq_save(flags);
 	set_32bit(true);
 
 	retval = security_file_ioctl(f.file, args.cmd, args.arg);
@@ -257,15 +273,14 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	 * workaround we pass the ioctls through unmodified if compat_ioctl is
 	 * not provided. This should work for most ioctls.
 	 */
-	else
+	else if (f.file->f_op->unlocked_ioctl)
 		retval = f.file->f_op->unlocked_ioctl(f.file, args.cmd,
 						      args.arg);
 #endif
 
 out:
 	set_32bit(false);
-	local_bh_enable();
-	preempt_enable();
+	local_irq_restore(flags);
 	fdput(f);
 
 	return retval;
@@ -275,6 +290,9 @@ static long
 tango32_compat_set_robust_list(struct tango32_compat_robust_list __user *argp)
 {
 	struct tango32_compat_robust_list args;
+
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
 
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
@@ -291,6 +309,9 @@ static long
 tango32_compat_get_robust_list(struct tango32_compat_robust_list __user *argp)
 {
 	struct tango32_compat_robust_list out;
+
+	if (!access_ok(argp, sizeof(out)))
+		return -EFAULT;
 
 	out.head = ptr_to_compat(current->compat_robust_list);
 	out.len = sizeof(*current->compat_robust_list);
@@ -448,7 +469,13 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 	struct getdents_callback64 buf = {};
 	int error;
 
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
+
 	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+
+	if (!access_ok((void __user *)args.dirp, args.count))
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
@@ -484,6 +511,9 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	struct fd f;
 	loff_t offset;
 
+	if (!access_ok(argp, sizeof(args)))
+		return -EFAULT;
+
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
 
@@ -509,7 +539,6 @@ out_putf:
 	my_fdput_pos(f);
 	return retval;
 }
-
 
 static long tango32_ioctl(struct file *filp, unsigned int cmd,
 			  unsigned long arg)
