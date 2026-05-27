@@ -9,8 +9,16 @@
 #include <linux/compat.h>
 #include <linux/thread_info.h>
 #include <linux/dirent.h>
-#include <linux/stddef.h>
 #include "tango32.h"
+
+/* Structural wrapper macros to handle opaque struct fd in Kernel 6.11+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#define TANGO_FD_FILE(f) fd_file(f)
+#define TANGO_FD_EMPTY(f) fd_empty(f)
+#else
+#define TANGO_FD_FILE(f) ((f).file)
+#define TANGO_FD_EMPTY(f) (!((f).file))
+#endif
 
 static bool is_32bit(void)
 {
@@ -238,7 +246,6 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	struct fd f;
 	long retval;
 	unsigned long flags;
-	struct file *file_ptr;
 
 	if (!access_ok(argp, sizeof(args)))
 		return -EFAULT;
@@ -247,13 +254,7 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 		return -EFAULT;
 
 	f = fdget(args.fd);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-	file_ptr = fd_file(f);
-#else
-	file_ptr = f.file;
-#endif
-
-	if (!file_ptr)
+	if (TANGO_FD_EMPTY(f))
 		return -EBADF;
 
 	/*
@@ -266,13 +267,13 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	local_irq_save(flags);
 	set_32bit(true);
 
-	retval = security_file_ioctl(file_ptr, args.cmd, args.arg);
+	retval = security_file_ioctl(TANGO_FD_FILE(f), args.cmd, args.arg);
 	if (retval)
 		goto out;
 
 	retval = -ENOIOCTLCMD;
-	if (file_ptr->f_op->compat_ioctl)
-		retval = file_ptr->f_op->compat_ioctl(file_ptr, args.cmd, args.arg);
+	if (TANGO_FD_FILE(f)->f_op->compat_ioctl)
+		retval = TANGO_FD_FILE(f)->f_op->compat_ioctl(TANGO_FD_FILE(f), args.cmd, args.arg);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
 #warning "Support for kernels before v5.6 is experimental"
@@ -281,8 +282,8 @@ static long tango32_compat_ioctl(struct tango32_compat_ioctl __user *argp)
 	 * workaround we pass the ioctls through unmodified if compat_ioctl is
 	 * not provided. This should work for most ioctls.
 	 */
-	else if (file_ptr->f_op->unlocked_ioctl)
-		retval = file_ptr->f_op->unlocked_ioctl(file_ptr, args.cmd,
+	else if (TANGO_FD_FILE(f)->f_op->unlocked_ioctl)
+		retval = TANGO_FD_FILE(f)->f_op->unlocked_ioctl(TANGO_FD_FILE(f), args.cmd,
 						      args.arg);
 #endif
 
@@ -450,26 +451,20 @@ efault:
 }
 #endif
 
-/* fdget_pos and fdput_pos are not exported to modules. */
+/* fdget_pos and fdput_pos modern implementations safely targeting opaque structs */
 static struct fd my_fdget_pos(unsigned int fd)
 {
 	struct fd f = fdget(fd);
-	struct file *file_ptr;
+	struct file *file = TANGO_FD_FILE(f);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-	file_ptr = fd_file(f);
-#else
-	file_ptr = f.file;
-#endif
-
-	if (file_ptr && (file_ptr->f_mode & FMODE_ATOMIC_POS)) {
-		if (file_count(file_ptr) > 1) {
+	if (file && (file->f_mode & FMODE_ATOMIC_POS)) {
+		if (file_count(file) > 1) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 			f.word |= FDPUT_POS_UNLOCK;
 #else
 			f.flags |= FDPUT_POS_UNLOCK;
 #endif
-			mutex_lock(&file_ptr->f_pos_lock);
+			mutex_lock(&file->f_pos_lock);
 		}
 	}
 	return f;
@@ -477,19 +472,19 @@ static struct fd my_fdget_pos(unsigned int fd)
 
 static void my_fdput_pos(struct fd fd)
 {
-	struct file *file_ptr;
-	bool unlock_required;
+	struct file *file = TANGO_FD_FILE(fd);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-	file_ptr = fd_file(fd);
-	unlock_required = (fd.word & FDPUT_POS_UNLOCK);
+	if (fd.word & FDPUT_POS_UNLOCK) {
+		if (file)
+			mutex_unlock(&file->f_pos_lock);
+	}
 #else
-	file_ptr = fd.file;
-	unlock_required = (fd.flags & FDPUT_POS_UNLOCK);
+	if (fd.flags & FDPUT_POS_UNLOCK) {
+		if (file)
+			mutex_unlock(&file->f_pos_lock);
+	}
 #endif
-
-	if (unlock_required && file_ptr)
-		mutex_unlock(&file_ptr->f_pos_lock);
 	fdput(fd);
 }
 
@@ -500,7 +495,6 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 	struct fd f;
 	struct getdents_callback64 buf = {};
 	int error;
-	struct file *file_ptr;
 
 	if (!access_ok(argp, sizeof(args)))
 		return -EFAULT;
@@ -512,20 +506,14 @@ tango32_compat_getdents64(struct tango32_compat_getdents64 __user *argp)
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-	file_ptr = fd_file(f);
-#else
-	file_ptr = f.file;
-#endif
-
-	if (!file_ptr)
+	if (TANGO_FD_EMPTY(f))
 		return -EBADF;
 
 	buf.ctx.actor = filldir64;
 	buf.count = args.count;
 	buf.current_dir = (struct linux_dirent64 __user *)args.dirp;
 
-	error = iterate_dir(file_ptr, &buf.ctx);
+	error = iterate_dir(TANGO_FD_FILE(f), &buf.ctx);
 	if (error >= 0)
 		error = buf.error;
 	if (buf.prev_reclen) {
@@ -549,7 +537,6 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 	int retval;
 	struct fd f;
 	loff_t offset;
-	struct file *file_ptr;
 
 	if (!access_ok(argp, sizeof(args)))
 		return -EFAULT;
@@ -558,20 +545,21 @@ static long tango32_compat_lseek(struct tango32_compat_lseek __user *argp)
 		return -EFAULT;
 
 	f = my_fdget_pos(args.fd);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-	file_ptr = fd_file(f);
-#else
-	file_ptr = f.file;
-#endif
-
-	if (!file_ptr)
+	if (TANGO_FD_EMPTY(f))
 		return -EBADF;
 
 	retval = -EINVAL;
+	
+#ifdef SEEK_MAX
 	if (args.whence > SEEK_MAX)
 		goto out_putf;
+#else
+	/* SEEK_MAX dropped in modern kernels; negative bound checks fall back directly to vfs_llseek */
+	if (args.whence < 0)
+		goto out_putf;
+#endif
 
-	offset = vfs_llseek(file_ptr, args.offset, args.whence);
+	offset = vfs_llseek(TANGO_FD_FILE(f), args.offset, args.whence);
 
 	retval = (int)offset;
 	if (offset >= 0) {
